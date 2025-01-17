@@ -1,87 +1,111 @@
-from azure.identity import DefaultAzureCredential
-from azure.mgmt.network import NetworkManagementClient
-from azure.mgmt.compute import ComputeManagementClient
-import sys
 import socket
-import concurrent.futures
 import ipaddress
+import concurrent.futures
+from datetime import datetime
+import platform
+import subprocess
 
-def get_azure_clients(subscription_id):
-    """Inițializează clienții Azure necesari."""
-    credential = DefaultAzureCredential()
-    network_client = NetworkManagementClient(credential, subscription_id)
-    compute_client = ComputeManagementClient(credential, subscription_id)
-    return network_client, compute_client
-
-def get_vnet_subnet_info(network_client, resource_group, vnet_name, subnet_name):
-    """Obține informații despre subnet-ul specificat."""
-    subnet = network_client.subnets.get(
-        resource_group,
-        vnet_name,
-        subnet_name
-    )
-    return subnet.address_prefix
-
-def check_ip_active(ip):
-    """Verifică dacă un IP este activ folosind o conexiune socket."""
+def get_my_ip():
+    """Obține adresa IP a mașinii locale."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        socket.create_connection((ip, 80), timeout=1)
-        return ip
-    except (socket.timeout, socket.error):
-        try:
-            socket.create_connection((ip, 443), timeout=1)
-            return ip
-        except (socket.timeout, socket.error):
-            return None
+        # Nu trebuie să fie o conexiune reală
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
 
-def scan_network(subnet_cidr):
-    """Scanează toate IP-urile din subnet pentru a găsi mașini active."""
-    network = ipaddress.IPv4Network(subnet_cidr)
-    active_ips = []
+def ping(ip):
+    """Verifică dacă un IP răspunde la ping."""
+    param = '-n' if platform.system().lower() == 'windows' else '-c'
+    command = ['ping', param, '1', str(ip)]
+    try:
+        output = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
+        return output.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+def check_ports(ip):
+    """Verifică dacă porturile comune sunt deschise."""
+    common_ports = [80, 443, 22, 3389]  # HTTP, HTTPS, SSH, RDP
+    for port in common_ports:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            result = sock.connect_ex((str(ip), port))
+            if result == 0:
+                return True
+            sock.close()
+        except:
+            continue
+    return False
+
+def scan_ip(ip):
+    """Scanează un IP pentru a verifica dacă este activ."""
+    if ping(ip) or check_ports(ip):
+        try:
+            hostname = socket.gethostbyaddr(str(ip))[0]
+        except socket.herror:
+            hostname = "N/A"
+        return (str(ip), hostname)
+    return None
+
+def scan_network(network_cidr):
+    """Scanează toate IP-urile din rețea."""
+    print(f"Începere scanare pentru rețeaua: {network_cidr}")
+    start_time = datetime.now()
     
-    # Folosim ThreadPoolExecutor pentru scanare paralelă
-    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-        future_to_ip = {executor.submit(check_ip_active, str(ip)): ip 
-                       for ip in network.hosts()}
+    # Convertește CIDR în obiect de rețea
+    network = ipaddress.IPv4Network(network_cidr)
+    active_hosts = []
+    
+    # Folosește ThreadPoolExecutor pentru scanare paralelă
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        future_to_ip = {executor.submit(scan_ip, ip): ip for ip in network.hosts()}
+        
+        total_ips = len(future_to_ip)
+        completed = 0
         
         for future in concurrent.futures.as_completed(future_to_ip):
+            completed += 1
+            if completed % 10 == 0:
+                print(f"Progres: {completed}/{total_ips} IP-uri scanate")
+            
             result = future.result()
             if result:
-                active_ips.append(result)
+                active_hosts.append(result)
     
-    return active_ips
+    end_time = datetime.now()
+    duration = end_time - start_time
+    
+    return active_hosts, duration
 
 def main():
-    # Parametrii necesari
-    subscription_id = input("Introduceți ID-ul subscripției Azure: ")
-    resource_group = input("Introduceți numele Resource Group: ")
-    vnet_name = input("Introduceți numele Virtual Network: ")
-    subnet_name = input("Introduceți numele Subnet: ")
+    # Obține IP-ul local și determină rețeaua
+    my_ip = get_my_ip()
+    network = ipaddress.IPv4Interface(f"{my_ip}/24").network
+    print(f"IP local detectat: {my_ip}")
+    print(f"Scanare rețea: {network}")
     
-    try:
-        # Inițializare clienți Azure
-        network_client, compute_client = get_azure_clients(subscription_id)
-        
-        # Obține informații despre subnet
-        subnet_cidr = get_vnet_subnet_info(network_client, resource_group, 
-                                         vnet_name, subnet_name)
-        
-        print(f"\nScanare subnet: {subnet_cidr}")
-        print("Scanare în progres...")
-        
-        # Scanează rețeaua pentru IP-uri active
-        active_ips = scan_network(subnet_cidr)
-        
-        # Afișează rezultatele
-        print("\nMașini active găsite:")
-        for ip in sorted(active_ips, key=lambda ip: [int(part) for part in ip.split('.')]):
-            print(f"IP activ: {ip}")
-        
-        print(f"\nTotal mașini active găsite: {len(active_ips)}")
-        
-    except Exception as e:
-        print(f"Eroare: {str(e)}")
-        sys.exit(1)
+    # Efectuează scanarea
+    active_hosts, duration = scan_network(str(network))
+    
+    # Afișează rezultatele
+    print("\nRezultatele scanării:")
+    print("-" * 50)
+    print(f"{'IP':<15} | {'Hostname':<35}")
+    print("-" * 50)
+    
+    for ip, hostname in sorted(active_hosts, key=lambda x: ipaddress.IPv4Address(x[0])):
+        print(f"{ip:<15} | {hostname:<35}")
+    
+    print("-" * 50)
+    print(f"\nScanare completă!")
+    print(f"Timp total: {duration}")
+    print(f"Host-uri active găsite: {len(active_hosts)}")
 
 if __name__ == "__main__":
     main()
